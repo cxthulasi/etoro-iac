@@ -83,7 +83,7 @@ jobs:
 
       - name: Terraform Init
         run: |
-          terraform init -input=false \
+          terraform init -input=false -reconfigure \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=${TF_STATE_KEY}" \
             -backend-config="region=${AWS_REGION}" \
