@@ -1,0 +1,171 @@
+###############################################################################
+# etoro-iac — GitHub Actions CI/CD for the Coralogix Terraform project
+#
+# GitHub-native equivalent of the AWS CodePipeline in ../cicd:
+#
+#   push to main ─► [ plan ] fmt · tflint · validate · plan -out=tfplan
+#                       │        (uploads the plan as an artifact)
+#                       ▼
+#                   [ approval ]  GitHub Environment "production" with
+#                       │         required reviewers  → email/notification
+#                       ▼
+#                   [ apply ]  terraform apply tfplan  → Coralogix
+#
+# IMPORTANT: GitHub only runs workflows from `.github/workflows/`. This file is
+# kept under github-cicd/ as the source of truth; copy it to activate:
+#
+#   mkdir -p .github/workflows
+#   cp github-cicd/workflows/etoro-iac.yml .github/workflows/etoro-iac.yml
+#
+# Required configuration (see github-cicd/README.md):
+#   Secrets:   CORALOGIX_API_KEY, AWS_ROLE_ARN
+#   Variables: TF_STATE_BUCKET
+#   Environment "production" with required reviewers (the approval gate).
+###############################################################################
+
+name: etoro-iac
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "etoro_iac/**"
+      - ".github/workflows/etoro-iac.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "etoro_iac/**"
+  workflow_dispatch:
+
+# Avoid overlapping applies racing on the same remote state.
+concurrency:
+  group: etoro-iac-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required for AWS OIDC (S3 backend access)
+
+env:
+  TF_VERSION: "1.10.5" # must be >= 1.10 for S3 native state locking
+  TFLINT_VERSION: "0.53.0"
+  WORKING_DIR: "etoro_iac"
+  TF_STATE_KEY: "etoro_iac/terraform.tfstate"
+  AWS_REGION: "ap-south-1"
+
+jobs:
+  plan:
+    name: Plan & Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v${{ env.TFLINT_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        env:
+          # Provider region is set via `env = "AP1"` in etoro_iac/versions.tf,
+          # so do NOT set CORALOGIX_DOMAIN (provider rejects env + domain).
+          CORALOGIX_API_KEY: ${{ secrets.CORALOGIX_API_KEY }}
+        run: terraform plan -input=false -lock-timeout=120s -out=tfplan
+
+      - name: Upload plan artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            ${{ env.WORKING_DIR }}/tfplan
+            ${{ env.WORKING_DIR }}/.terraform.lock.hcl
+          retention-days: 5
+          include-hidden-files: true
+
+  apply:
+    name: Apply (approved plan)
+    needs: plan
+    # Only on pushes to main (and manual dispatch) — never on PRs.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The approval gate: configure "production" with required reviewers in
+    # Settings → Environments. Reviewers are notified and must approve before
+    # this job runs — the equivalent of the SNS email approval in the AWS stack.
+    environment: production
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Init
+        # -reconfigure: refresh the local backend cache without migrating;
+        # state location is unchanged, so the saved tfplan stays valid.
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Apply
+        env:
+          CORALOGIX_API_KEY: ${{ secrets.CORALOGIX_API_KEY }}
+        run: terraform apply -input=false -lock-timeout=120s -auto-approve tfplan
